@@ -11,14 +11,14 @@ library(tidyverse)
 
 
 # build a query to retrieve DNA expression data
-query <- GDCquery(project = 'TCGA-KIRP', #Lung squamous cell carcinoma, getGDCprojects()$project_id for full option list
+query <- GDCquery(project = 'TCGA-KIRP', #Kidney renal papillary cell carcinoma, use getGDCprojects()$project_id for full option list
                   data.category = 'Transcriptome Profiling',
                   experimental.strategy = 'RNA-Seq',
                   workflow.type = 'STAR - Counts',
                   access = 'open',
                   data.type = 'Gene Expression Quantification')
 
-# View sample metadata before downloading
+# View sample metadata before downloading (Optional)
 output_query <- getResults(query)
 dim(output_query)
 
@@ -26,16 +26,18 @@ dim(output_query)
 GDCdownload(query, files.per.chunk = 165)
 
 # prepare data
-## run to save prepared data as TCGA_LGG.rda
+## run to save prepared data as TCGA_KIRP.rda
 kirp_data <- GDCprepare(query, 
                         summarizedExperiment = TRUE, #Default
                         save=TRUE, 
                         save.filename = 'TCGA_KIRP.rda')
 View(kirp_data)
 
+#Preprocessing gives the expression data matrix.
+#This isn't required if DESeq2 or limma are being used for the DE analysis as those require raw counts
 preprocessed_kirp <- TCGAanalyze_Preprocessing(
   kirp_data,
-  cor.cut = 0.6,
+  cor.cut = 0.6, #Samples with correlation coefficients of less than 0.6 are considered otliers and removed
   datatype = "unstranded",   # Make sure this matches your RNA-seq data type
   filename = "KIRP_preprocessing_result2.png"
 )
@@ -94,13 +96,13 @@ sum(sample_info$tissue_type == "Tumor")
 normal_tissue <- sample_info[sample_info$tissue_type == "Normal", ]
 tumor_tissue <- sample_info[sample_info$tissue_type == "Tumor", ]
 
-#Selecting 48 random tumor samples
+#Selecting 48 random tumor samples with sample() function
 tumor_tissue <- tumor_tissue[sample(nrow(tumor_tissue), 48), ]
 
 #Binding tumor and normal samples
 working_sample_info <- rbind(normal_tissue, tumor_tissue)
 
-#Making the samples (columns) of expression data align with samples (rows) of gene data
+#Making the samples (columns) of expression data align with samples (rows) of sample_info
 working_sample_info <- working_sample_info %>%
   rownames_to_column(var = "number_id") %>% #Converts numbered rownames to column
   mutate(barcode_copy = barcode) %>%       # Create a new column to keep barcodes
@@ -111,7 +113,7 @@ working_sample_info <- working_sample_info %>%
 preprocessed_kirp <- preprocessed_kirp[, rownames(working_sample_info)]
 dim(preprocessed_kirp)
 
-#Checking if matching was done correctly
+#Checking if matching was done correctly and in the right order
 table(rownames(working_sample_info) %in% colnames(preprocessed_kirp))
 table(rownames(working_sample_info) == colnames(preprocessed_kirp))
 
@@ -121,10 +123,6 @@ dim(preprocessed_kirp)
 
 #Matched gene names in gene_info, with expression data
 gene_info <- gene_info[rownames(gene_info) == rownames(preprocessed_kirp), ]
-
-#Checking if matching was done correctly
-table(rownames(gene_info) %in% rownames(preprocessed_kirp))
-table(rownames(gene_info) == rownames(preprocessed_kirp))
 
 #Save your data to files
 write.csv(gene_info, 'gene_info.csv')
@@ -136,9 +134,13 @@ gene_info <- read.csv('gene_info.csv', row.names = 1)
 working_sample_info <- read.csv('working_sample_info.csv', row.names = 1)
 preprocessed_kirp <- read.csv('preprocessed_kirp', row.names = 1)
 
-#Set my group
+##########################################################################
+################# DIFFERENTIAL EXPRESSION ANALYSIS #######################
+##########################################################################
+#Set my group to store each sample's tissue type
 group <- working_sample_info$tissue_type
 
+#Carry out my DEA based on my set groups
 de_results <- TCGAanalyze_DEA(
   mat1 = preprocessed_kirp[, group == "Normal"],
   mat2 = preprocessed_kirp[, group == "Tumor"],
@@ -160,10 +162,11 @@ p <- TCGAVisualize_volcano(de_results$logFC,
                       title = "Volcano plot for DE genes")
 ggsave("tcga_volcano_plot.png", plot = p, width = 15, height = 10, dpi = 300)
 
-sig_de_results <- de_results[abs(de_results$logFC) > 2 & abs(de_results$FDR) < 0.05,]
+#Subsetting my significantly DEGs based on logFC and FDR
+sig_de_results <- de_results[abs(de_results$logFC) > 2 & de_results$FDR < 0.05,]
 write.csv(sig_de_results, "sig_de_results.csv")
 
-#Get your upregulated and downregulated genes using dplyr
+#Get your top upregulated and downregulated genes using dplyr
 top_25_upregulated <- sig_de_results %>% 
   arrange(desc(logFC)) %>% 
   head(., 25)
@@ -173,6 +176,7 @@ top_25_downregulated <- sig_de_results %>%
   head(., 25)
 
 #Prepare data for counts and values of upregulated genes
+#Select the top 25 upregulated genes and change to long format so you can left_join with sample_info
 upregulated_plot_data <- preprocessed_kirp[rownames(top_25_upregulated), ] %>% 
   as.data.frame() %>% 
   rownames_to_column("genes") %>% 
@@ -181,7 +185,7 @@ upregulated_plot_data <- preprocessed_kirp[rownames(top_25_upregulated), ] %>%
                values_to = "count") %>% 
   left_join(., working_sample_info, by = c("samples" = "barcode_copy"))
 
-#Add log2FC and FDR values
+#Add log2FC and FDR values from DE results
 upregulated_plot_data <-  as.data.frame(upregulated_plot_data) %>% 
   left_join(., sig_de_results %>% 
               rownames_to_column(var = "genes") %>% 
@@ -205,7 +209,7 @@ upregulated_plot <-  ggplot(upregulated_plot_data, aes(x = tissue_type, y = log2
             vjust = 1.25, size = 3, inherit.aes = FALSE)
 
 
-#Prepare data for counts and values of downregulated genes
+#Prepare data for counts and values of downregulated genes, manipulate and create the plot just as for upregulated genes
 downregulated_plot_data <- preprocessed_kirp[rownames(top_25_downregulated), ] %>% 
   as.data.frame() %>% 
   rownames_to_column("genes") %>% 
@@ -243,15 +247,16 @@ write.csv(downregulated_plot_data, "downregulated_plot_data.csv")
 ggsave("top_25_upregulated_genes.png", plot = upregulated_plot, width = 15, height = 10, dpi = 300)
 ggsave("top_25_downregulated_genes.png", plot = downregulated_plot, width = 15, height = 10, dpi = 300)
 
-
-## Enrichment Analysis
+###################################################################
+#################### ENRICHMENT ANALYSIS ##########################
+###################################################################
 library(clusterProfiler)
 library(org.Hs.eg.db) # Human gene annotation database
 
 # Extract gene IDs
 genes <- rownames(sig_de_results)
 
-# Convert Ensembl IDs to Entrez IDs
+# Convert Ensembl IDs to Entrez IDs as enrichKEGG only accepts Entrez gene IDs
 gene_conversion <- bitr(genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
 
 # Create gene list for enrichment
